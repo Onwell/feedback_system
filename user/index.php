@@ -72,12 +72,24 @@ function db(): PDO
             type         ENUM('Complaint','Enquiry','Compliment','Suggestion') NOT NULL,
             priority     ENUM('Low','Medium','High') NOT NULL DEFAULT 'Medium',
             summary      TEXT NOT NULL,
+            forwarded_to VARCHAR(120) NOT NULL DEFAULT '',
+            courtesy_response TEXT NULL,
             channel      VARCHAR(40) NOT NULL DEFAULT 'Website',
             created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             INDEX (type), INDEX (priority), INDEX (submitted_by)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     ");
+
+    $feedbackColumns = array_column($pdo->query('SHOW COLUMNS FROM feedback')->fetchAll(), 'Field');
+    foreach ([
+        'forwarded_to' => "VARCHAR(120) NOT NULL DEFAULT ''",
+        'courtesy_response' => 'TEXT NULL',
+    ] as $column => $definition) {
+        if (!in_array($column, $feedbackColumns, true)) {
+            $pdo->exec("ALTER TABLE feedback ADD COLUMN $column $definition");
+        }
+    }
 
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS settings (
@@ -201,15 +213,15 @@ function pill_priority(string $p): string
 $pdo = db();
 
 if (($_GET['export'] ?? '') === 'csv') {
-    $rows = $pdo->query("SELECT reference, type, priority, summary, channel, created_at FROM feedback ORDER BY created_at DESC")->fetchAll() ?: [];
+    $rows = $pdo->query("SELECT reference, name, type, priority, summary, forwarded_to, courtesy_response, channel, created_at FROM feedback ORDER BY created_at DESC")->fetchAll() ?: [];
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="feedback-register-' . date('Ymd-His') . '.csv"');
     $out = fopen('php://output', 'w');
-    fputcsv($out, ['Reference','Type','Priority','Summary','Channel','Created']);
+    fputcsv($out, ['Reference','Client name','Type','Priority','Summary','Forwarded to','Courtesy response','Channel','Created']);
     foreach ($rows as $r) {
         fputcsv($out, [
-            $r['reference'], $r['type'], $r['priority'],
-            $r['summary'], $r['channel'], $r['created_at'],
+            $r['reference'], $r['name'], $r['type'], $r['priority'],
+            $r['summary'], $r['forwarded_to'], $r['courtesy_response'], $r['channel'], $r['created_at'],
         ]);
     }
     fclose($out);
@@ -229,7 +241,7 @@ if (($_GET['export'] ?? '') === 'report') {
         $where .= ' AND DATE(created_at) <= :dt';
         $params[':dt'] = $dt;
     }
-    $stmt = $pdo->prepare("SELECT reference, type, priority, summary, channel, created_at FROM feedback WHERE $where ORDER BY created_at DESC");
+    $stmt = $pdo->prepare("SELECT reference, name, type, priority, summary, forwarded_to, courtesy_response, channel, created_at FROM feedback WHERE $where ORDER BY created_at DESC");
     $stmt->execute($params);
     $rows = $stmt->fetchAll() ?: [];
 
@@ -242,11 +254,11 @@ if (($_GET['export'] ?? '') === 'report') {
     fputcsv($out, []);
     fputcsv($out, ['Total records', $total]);
     fputcsv($out, []);
-    fputcsv($out, ['Reference','Type','Priority','Summary','Channel','Created']);
+    fputcsv($out, ['Reference','Client name','Type','Priority','Summary','Forwarded to','Courtesy response','Channel','Created']);
     foreach ($rows as $r) {
         fputcsv($out, [
-            $r['reference'], $r['type'], $r['priority'],
-            $r['summary'], $r['channel'], $r['created_at'],
+            $r['reference'], $r['name'], $r['type'], $r['priority'],
+            $r['summary'], $r['forwarded_to'], $r['courtesy_response'], $r['channel'], $r['created_at'],
         ]);
     }
     fclose($out);
@@ -266,20 +278,24 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
         $type     = (string)($_POST['type'] ?? 'Complaint');
         $priority = (string)($_POST['priority'] ?? 'Medium');
         $summary  = trim((string)($_POST['summary'] ?? ''));
+        $forwardedTo = trim((string)($_POST['forwarded_to'] ?? ''));
+        $courtesyResponse = trim((string)($_POST['courtesy_response'] ?? ''));
         $channel  = (string)($_POST['channel'] ?? 'Website');
 
         $allowedTypes = ['Complaint','Enquiry','Compliment','Suggestion'];
         $allowedPrio  = ['Low','Medium','High'];
         if (!in_array($type, $allowedTypes, true))     $type = 'Complaint';
-        if (!in_array($priority, $allowedPrio, true))  $priority = 'Medium';
+        if ($type === 'Complaint' || $type === 'Compliment' || !in_array($priority, $allowedPrio, true)) {
+            $priority = 'Medium';
+        }
 
-        if ($summary !== '') {
+        if ($summary !== '' && mb_strlen($forwardedTo, 'UTF-8') <= 120 && mb_strlen($courtesyResponse, 'UTF-8') <= 10000) {
             $pdo->beginTransaction();
             try {
                 $ref = next_reference($pdo, $type);
                 $stmt = $pdo->prepare(
-                    'INSERT INTO feedback (reference, submitted_by, name, type, priority, summary, channel)
-                     VALUES (:ref, :by, :name, :type, :priority, :summary, :channel)'
+                    'INSERT INTO feedback (reference, submitted_by, name, type, priority, summary, forwarded_to, courtesy_response, channel)
+                     VALUES (:ref, :by, :name, :type, :priority, :summary, :forwarded_to, :courtesy_response, :channel)'
                 );
                 $stmt->execute([
                     ':ref'      => $ref,
@@ -288,6 +304,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
                     ':type'     => $type,
                     ':priority' => $priority,
                     ':summary'  => $summary,
+                    ':forwarded_to' => $forwardedTo,
+                    ':courtesy_response' => $courtesyResponse !== '' ? $courtesyResponse : null,
                     ':channel'  => $channel,
                 ]);
                 log_action($pdo, $name, 'Submitted feedback', $ref, "$type via user portal");
@@ -299,8 +317,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
                 }
                 flash_set('error', 'Could not save feedback', $ex->getMessage());
             }
-        } else {
+        } elseif ($summary === '') {
             flash_set('error', 'Missing summary', 'Please describe the feedback before submitting.');
+        } else {
+            flash_set('error', 'Feedback field too long', 'Forwarded to must be 120 characters or fewer and the courtesy response must be 10,000 characters or fewer.');
         }
         header('Location: ?page=cases', true, 303);
         exit;
@@ -327,7 +347,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
 /* =========================================================
    LOAD DATA
    ========================================================= */
-$all = $pdo->query('SELECT reference, name, type, priority, summary, channel, created_at FROM feedback ORDER BY created_at DESC')->fetchAll() ?: [];
+$all = $pdo->query('SELECT reference, name, type, priority, summary, forwarded_to, courtesy_response, channel, created_at FROM feedback ORDER BY created_at DESC')->fetchAll() ?: [];
 
 $recent = array_slice($all, 0, 5);
 $total  = count($all);
@@ -350,11 +370,11 @@ $flash     = flash_take();
 $notifRead = (int)($_SESSION['notif_read_at'] ?? 0);
 
 $page = (string)($_GET['page'] ?? 'overview');
-$validPages = ['overview','cases','insights','reports','notifications'];
+$validPages = ['overview','cases','insights','ai-insights','reports','notifications'];
 if (!in_array($page, $validPages, true)) $page = 'overview';
 $crumbLabels = [
     'overview'=>'Executive dashboard','cases'=>'Feedback register',
-    'insights'=>'Insights','reports'=>'Reports centre','notifications'=>'Notifications',
+    'insights'=>'Insights','ai-insights'=>'AI Insights','reports'=>'Reports centre','notifications'=>'Notifications',
 ];
 
 /* Icons */
@@ -650,6 +670,15 @@ svg{display:block}
 }
 .toast.show{display:block}
 
+/* AI-assisted local feedback analysis */
+.ai-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+.ai-card{border:1px solid var(--line);border-radius:12px;padding:15px;background:#fff;box-shadow:var(--shadow)}
+.ai-card .label{font-size:11px;color:var(--muted)}.ai-card .value{font-size:20px;font-weight:700;margin-top:4px}
+.ai-note{font-size:12px;color:var(--muted);margin:5px 0 0}
+.ai-list{display:grid;gap:10px}
+.ai-item{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe}
+.ai-item b{display:block;font-size:13px;margin-bottom:3px}.ai-item p{margin:0;color:var(--muted);font-size:12px}
+
 /* Modal */
 .modal-backdrop{
   position:fixed;inset:0;background:rgba(15,30,53,.15);
@@ -735,6 +764,7 @@ svg{display:block}
       <button class="<?= $page === 'overview' ? 'active' : '' ?>" data-page="overview"><span class="ico"><?= $IC['dashboard'] ?></span>Executive dashboard</button>
       <button class="<?= $page === 'cases' ? 'active' : '' ?>" data-page="cases"><span class="ico"><?= $IC['register'] ?></span>Feedback register</button>
       <button class="<?= $page === 'insights' ? 'active' : '' ?>" data-page="insights"><span class="ico"><?= $IC['insights'] ?></span>Insights</button>
+      <button class="<?= $page === 'ai-insights' ? 'active' : '' ?>" data-page="ai-insights"><span class="ico"><?= $IC['insights'] ?></span>AI Insights</button>
       <button class="<?= $page === 'reports' ? 'active' : '' ?>" data-page="reports"><span class="ico"><?= $IC['reports'] ?></span>Reports centre</button>
       <button class="<?= $page === 'notifications' ? 'active' : '' ?>" data-page="notifications"><span class="ico"><?= $IC['bell'] ?></span>Notifications<?php if (count($attention) > 0 && !$notifRead): ?><span class="count"><?= count($attention) ?></span><?php endif; ?></button>
     </nav>
@@ -984,16 +1014,19 @@ svg{display:block}
           </div>
           <div class="table-scroll">
             <table class="table">
-              <thead><tr><th>Reference</th><th>Feedback</th><th>Category</th><th>Priority</th><th>Received</th></tr></thead>
+              <thead><tr><th>Reference</th><th>Client name</th><th>Feedback</th><th>Category</th><th>Priority</th><th>Forwarded to</th><th>Courtesy response</th><th>Received</th></tr></thead>
               <tbody id="caseRows">
               <?php if (!$all): ?>
-                <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:28px">No feedback yet. Click Record feedback to create the first submission.</td></tr>
+              <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:28px">No feedback yet. Click Record feedback to create the first submission.</td></tr>
               <?php else: foreach ($all as $r): ?>
-                <tr data-ref="<?= e($r['reference']) ?>" data-name="<?= e($r['name']) ?>" data-summary="<?= e($r['summary']) ?>" data-type="<?= e($r['type']) ?>" data-priority="<?= e($r['priority']) ?>">
+                <tr data-ref="<?= e($r['reference']) ?>" data-name="<?= e($r['name']) ?>" data-summary="<?= e($r['summary']) ?>" data-forwarded="<?= e($r['forwarded_to']) ?>" data-courtesy="<?= e($r['courtesy_response']) ?>" data-type="<?= e($r['type']) ?>" data-priority="<?= e($r['priority']) ?>">
                   <td><span class="ref"><?= e($r['reference']) ?></span></td>
+                  <td><?= e($r['name']) ?></td>
                   <td style="min-width:210px;max-width:280px;white-space:normal"><?= e($r['summary']) ?></td>
                   <td><?= e($r['type']) ?></td>
                   <td><?= pill_priority($r['priority']) ?></td>
+                  <td><?= e($r['forwarded_to'] ?: '—') ?></td>
+                  <td style="min-width:190px;max-width:260px;white-space:normal"><?= e($r['courtesy_response'] ?: '—') ?></td>
                   <td><?= e(format_date($r['created_at'])) ?></td>
                 </tr>
               <?php endforeach; endif; ?>
@@ -1048,6 +1081,22 @@ svg{display:block}
               <div class="attention-item"><div class="attention-icon info" style="background:#e6f8f0;color:#15966a"><span class="icon"><?= $IC['layers'] ?></span></div><div><b>Most common category</b><p><?= e($topType) ?> accounts for the largest share of feedback.</p></div></div>
             </div>
           </div>
+        </div>
+      </section>
+
+      <section class="page <?= $page === 'ai-insights' ? 'active' : '' ?>" id="page-ai-insights">
+        <div class="page-head">
+          <div><div class="eyebrow">AI-assisted analysis</div><h1>AI Insights</h1><p>Explore patterns and recommended follow-ups from the live feedback register.</p></div>
+          <div class="actions"><button type="button" class="btn primary" id="aiRefresh"><span class="icon"><?= $IC['insights'] ?></span>Refresh analysis</button></div>
+        </div>
+        <div class="card" style="margin-bottom:16px">
+          <b>Privacy and method</b>
+          <p class="sub" style="margin:4px 0 0">Analysis runs locally in your browser using category, priority, channel, date and recurring words in feedback summaries. No feedback text is sent to an external AI service.</p>
+        </div>
+        <div class="ai-grid" id="aiSummary" aria-live="polite"></div>
+        <div class="grid midgrid">
+          <div class="card"><div class="card-head"><div><h2>Recurring themes</h2><p>Topics found in feedback summaries</p></div></div><div class="ai-list" id="aiThemes"></div></div>
+          <div class="card"><div class="card-head"><div><h2>Suggested actions</h2><p>Recommended next steps from current patterns</p></div></div><div class="ai-list" id="aiActions"></div></div>
         </div>
       </section>
 
@@ -1110,12 +1159,14 @@ svg{display:block}
     <form id="feedbackForm" method="post" action="">
       <input type="hidden" name="action" value="create">
       <div class="modal-body">
-        <div class="field"><label for="fName">Submitted by (optional)</label><input id="fName" name="name" placeholder="Leave blank to record as Anonymous" autocomplete="off"></div>
+        <div class="field"><label for="fName">Client name (optional)</label><input id="fName" name="name" placeholder="Leave blank to record as Anonymous" autocomplete="off"></div>
         <div class="form-grid">
           <div class="field"><label for="fType">Category</label><select id="fType" name="type"><option>Complaint</option><option>Enquiry</option><option>Compliment</option><option>Suggestion</option></select></div>
-          <div class="field"><label for="fPriority">Priority</label><select id="fPriority" name="priority"><option>Medium</option><option>High</option><option>Low</option></select></div>
+          <div class="field" id="priorityField"><label for="fPriority">Priority</label><select id="fPriority" name="priority"><option>Medium</option><option>High</option><option>Low</option></select></div>
         </div>
         <div class="field"><label for="fSummary">Feedback summary</label><textarea id="fSummary" name="summary" required placeholder="What was the feedback about?"></textarea></div>
+        <div class="field"><label for="fForwarded">Forwarded to</label><input id="fForwarded" name="forwarded_to" maxlength="120" placeholder="Officer or department"></div>
+        <div class="field"><label for="fCourtesy">Courtesy response</label><textarea id="fCourtesy" name="courtesy_response" maxlength="10000" placeholder="Response given to the client, if any"></textarea></div>
         <div class="field"><label for="fChannel">Channel</label>
           <select id="fChannel" name="channel">
             <?php foreach ($settings['channels'] as $c): ?>
@@ -1137,7 +1188,7 @@ svg{display:block}
       <button class="close-x" type="button" aria-label="Close" onclick="closeHelp()"><span class="icon"><?= $IC['x'] ?></span></button>
     </div>
     <div class="modal-body">
-      <div class="field"><label>Record feedback</label><div style="font-size:12px;color:#334155">Open <strong>Record feedback</strong> from the dashboard or register. Choose category, priority, channel, and save. You'll receive a unique reference (e.g. FB-2026-C0001).</div></div>
+      <div class="field"><label>Record feedback</label><div style="font-size:12px;color:#334155">Open <strong>Record feedback</strong> from the dashboard or register. Add the client name, category, feedback summary, forwarding destination and any courtesy response. Priority is available for enquiries and suggestions. You'll receive a unique reference (e.g. FB-2026-C0001).</div></div>
       <div class="field"><label>Monitor feedback</label><div style="font-size:12px;color:#334155">All submissions appear in the <strong>Feedback register</strong>. Use search and filters to browse records by category and priority.</div></div>
       <div class="field"><label>Export &amp; reports</label><div style="font-size:12px;color:#334155">Use <strong>Export CSV</strong> for the full register, or <strong>Reports centre</strong> for a filtered summary by date range.</div></div>
       <div class="field"><label>Need more help?</label><div style="font-size:12px;color:#334155">Contact your system administrator.</div></div>
@@ -1152,21 +1203,89 @@ svg{display:block}
 (function () {
   const $  = s => document.querySelector(s);
   const $$ = s => [...document.querySelectorAll(s)];
+  const AI_FEEDBACK = <?= json_encode($all, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+  const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  function renderAIInsights() {
+    const total = AI_FEEDBACK.length;
+    const countBy = key => Object.entries(AI_FEEDBACK.reduce((counts, row) => {
+      const value = row[key] || 'Unknown';
+      counts[value] = (counts[value] || 0) + 1;
+      return counts;
+    }, {})).sort((a, b) => b[1] - a[1]);
+    const types = countBy('type');
+    const channels = countBy('channel');
+    const high = AI_FEEDBACK.filter(row => row.priority === 'High').length;
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
+    const recentStart = new Date(today); recentStart.setDate(recentStart.getDate() - 29);
+    const previousStart = new Date(today); previousStart.setDate(previousStart.getDate() - 59);
+    const recentCount = AI_FEEDBACK.filter(row => {
+      const date = new Date(String(row.created_at).replace(' ', 'T'));
+      return date >= recentStart && date < tomorrow;
+    }).length;
+    const previousCount = AI_FEEDBACK.filter(row => {
+      const date = new Date(String(row.created_at).replace(' ', 'T'));
+      return date >= previousStart && date < recentStart;
+    }).length;
+    const trend = previousCount
+      ? `${recentCount >= previousCount ? '+' : ''}${Math.round((recentCount - previousCount) / previousCount * 100)}% vs previous 30 days`
+      : (recentCount ? 'New activity in the last 30 days' : 'No activity in the last 30 days');
+    const topicRules = [
+      ['Response and communication', ['response','respond','reply','communication','update','information']],
+      ['Waiting and delays', ['wait','waiting','delay','queue','late','slow']],
+      ['Staff and service', ['staff','service','attitude','helpful','professional','rude']],
+      ['Digital services', ['website','online','portal','system','application','login']],
+      ['Access and facilities', ['access','accessible','wheelchair','entrance','facility','building']]
+    ];
+    const themes = topicRules.map(([label, words]) => ({
+      label,
+      count: AI_FEEDBACK.filter(row => words.some(word => String(row.summary || '').toLowerCase().includes(word))).length
+    })).filter(theme => theme.count > 0).sort((a, b) => b.count - a.count);
+
+    const summary = [
+      ['Records analysed', total, 'All feedback in the live register'],
+      ['Leading category', types[0] ? `${types[0][0]} · ${types[0][1]}` : 'No category yet', 'Most frequently submitted feedback type'],
+      ['High priority', `${high} · ${total ? Math.round(high / total * 100) : 0}%`, 'Share of records marked high priority'],
+      ['Last 30 days', recentCount, trend],
+      ['Leading channel', channels[0] ? `${channels[0][0]} · ${channels[0][1]}` : 'No channel yet', 'Most common submission channel']
+    ];
+    $('#aiSummary').innerHTML = summary.map(([label, value, note]) =>
+      `<div class="ai-card"><div class="label">${escapeHTML(label)}</div><div class="value">${escapeHTML(value)}</div><p class="ai-note">${escapeHTML(note)}</p></div>`
+    ).join('');
+    $('#aiThemes').innerHTML = themes.length
+      ? themes.slice(0, 5).map(theme => `<div class="ai-item"><b>${escapeHTML(theme.label)}</b><p>Matched in ${theme.count} ${theme.count === 1 ? 'record' : 'records'}.</p></div>`).join('')
+      : '<div class="em">No recurring themes detected yet. Feedback summaries will help reveal patterns.</div>';
+
+    const actions = [];
+    if (high) actions.push([`Review ${high} high-priority ${high === 1 ? 'record' : 'records'}`, 'Open the register and prioritize these submissions for follow-up.']);
+    if (types[0] && types[0][0] === 'Complaint') actions.push(['Investigate complaint drivers', `Complaints lead the register (${types[0][1]} records); review cases for service improvements.`]);
+    if (themes[0]) actions.push([`Follow up on ${themes[0].label.toLowerCase()}`, `This theme appears in ${themes[0].count} ${themes[0].count === 1 ? 'record' : 'records'}; check whether an operational change could address it.`]);
+    if (channels[0]) actions.push([`Monitor the ${channels[0][0]} channel`, `It accounts for ${channels[0][1]} ${channels[0][1] === 1 ? 'record' : 'records'}; ensure submissions there are consistently reviewed.`]);
+    if (!total) actions.push(['Start collecting feedback', 'Insights will appear after feedback is submitted.']);
+    $('#aiActions').innerHTML = actions.map(([title, description]) =>
+      `<div class="ai-item"><b>${escapeHTML(title)}</b><p>${escapeHTML(description)}</p></div>`
+    ).join('');
+  }
 
   /* Page navigation */
   window.showPage = function (name) {
     $$('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + name));
     $$('.nav button[data-page]').forEach(b => b.classList.toggle('active', b.dataset.page === name));
-    const labels = {overview:'Executive dashboard',cases:'Feedback register',insights:'Insights',reports:'Reports centre',notifications:'Notifications'};
+    const labels = {overview:'Executive dashboard',cases:'Feedback register',insights:'Insights','ai-insights':'AI Insights',reports:'Reports centre',notifications:'Notifications'};
     const crumb = document.getElementById('crumb'); if (crumb) crumb.textContent = labels[name] || name;
     const sb = document.getElementById('sidebar'); if (sb) sb.classList.remove('show');
     const bk = document.getElementById('sidebarBackdrop'); if (bk) bk.classList.remove('show');
     const np = document.getElementById('notificationPanel'); if (np) np.classList.remove('open');
     if (name === 'cases') renderCases();
+    if (name === 'ai-insights') renderAIInsights();
     history.replaceState(null, '', '?page=' + name);
     window.scrollTo({top:0,behavior:'smooth'});
   };
   $$('.nav button[data-page]').forEach(b => b.addEventListener('click', () => showPage(b.dataset.page)));
+  const aiRefresh = document.getElementById('aiRefresh');
+  if (aiRefresh) aiRefresh.addEventListener('click', renderAIInsights);
+  if (document.getElementById('page-ai-insights').classList.contains('active')) renderAIInsights();
 
   /* Sidebar (mobile) */
   const sidebar = document.getElementById('sidebar');
@@ -1205,7 +1324,7 @@ svg{display:block}
     const p = document.getElementById('priorityFilter').value;
     let shown = 0;
     $$('#caseRows tr').forEach(tr => {
-      const hay = [tr.dataset.ref, tr.dataset.name, tr.dataset.summary, tr.dataset.type].join(' ').toLowerCase();
+      const hay = [tr.dataset.ref, tr.dataset.name, tr.dataset.summary, tr.dataset.forwarded, tr.dataset.courtesy, tr.dataset.type].join(' ').toLowerCase();
       const ok = (!q || hay.includes(q)) && (!t || tr.dataset.type === t) && (!p || tr.dataset.priority === p);
       tr.style.display = ok ? '' : 'none';
       if (ok) shown++;
@@ -1242,6 +1361,17 @@ svg{display:block}
   };
 
   const form = document.getElementById('feedbackForm');
+  const typeSelect = document.getElementById('fType');
+  const priorityField = document.getElementById('priorityField');
+  const prioritySelect = document.getElementById('fPriority');
+  const updatePriorityVisibility = () => {
+    const priorityHidden = ['Complaint','Compliment'].includes(typeSelect.value);
+    priorityField.hidden = priorityHidden;
+    prioritySelect.disabled = priorityHidden;
+    if (priorityHidden) prioritySelect.value = 'Medium';
+  };
+  typeSelect.addEventListener('change', updatePriorityVisibility);
+  updatePriorityVisibility();
   if (form) form.addEventListener('submit', e => {
     if (!document.getElementById('fSummary').value.trim()) {
       e.preventDefault();

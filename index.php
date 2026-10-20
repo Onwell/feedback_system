@@ -622,7 +622,6 @@ input[aria-invalid="true"]{border-color:var(--ba);box-shadow:0 0 0 3px rgba(224,
         </form>
 
         <p class="swap">Already registered? <button type="button" data-v="login">Sign in</button></p>
-        <p class="note">Accounts are stored in the <b>ncc_feedback_db</b> MySQL database.</p>
       </div>
 
     <?php endif; ?>

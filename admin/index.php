@@ -47,12 +47,23 @@ try {
             type ENUM('Complaint','Enquiry','Compliment','Suggestion') NOT NULL,
             priority ENUM('Low','Medium','High') NOT NULL DEFAULT 'Medium',
             summary TEXT NOT NULL,
+            forwarded_to VARCHAR(120) NOT NULL DEFAULT '',
+            courtesy_response TEXT NULL,
             channel VARCHAR(40) NOT NULL DEFAULT 'Website',
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             INDEX (type), INDEX (priority), INDEX (submitted_by)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     ");
+    $feedbackColumns = array_column($pdo->query('SHOW COLUMNS FROM feedback')->fetchAll(), 'Field');
+    foreach ([
+        'forwarded_to' => "VARCHAR(120) NOT NULL DEFAULT ''",
+        'courtesy_response' => 'TEXT NULL',
+    ] as $column => $definition) {
+        if (!in_array($column, $feedbackColumns, true)) {
+            $pdo->exec("ALTER TABLE feedback ADD COLUMN $column $definition");
+        }
+    }
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS settings (
             k VARCHAR(64) PRIMARY KEY,
@@ -72,7 +83,7 @@ try {
     ");
 
     $databaseEntries = $pdo->query(
-        'SELECT id, reference, submitted_by, name, type, priority, summary, channel, created_at
+        'SELECT id, reference, submitted_by, name, type, priority, summary, forwarded_to, courtesy_response, channel, created_at
          FROM feedback ORDER BY created_at DESC, id DESC'
     )->fetchAll();
     $databaseOfficers = $pdo->query('SELECT id, name, email, role FROM users ORDER BY name')->fetchAll();
@@ -119,10 +130,13 @@ try {
                 $type = (string)($input['type'] ?? '');
                 $entryName = trim((string)($input['name'] ?? ''));
                 $summary = trim((string)($input['summary'] ?? ''));
+                $forwardedTo = trim((string)($input['forwarded_to'] ?? ''));
+                $courtesyResponse = trim((string)($input['courtesy_response'] ?? ''));
                 $date = (string)($input['date'] ?? '');
                 $channel = trim((string)($input['channel'] ?? 'Website'));
                 if (!in_array($type, ['Complaint', 'Enquiry', 'Compliment', 'Suggestion'], true)
                     || $entryName === '' || $summary === ''
+                    || mb_strlen($forwardedTo, 'UTF-8') > 120 || mb_strlen($courtesyResponse, 'UTF-8') > 10000
                     || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
                     throw new InvalidArgumentException('Complete all required feedback fields with valid values.');
                 }
@@ -135,9 +149,9 @@ try {
                         throw new RuntimeException('Feedback record not found.');
                     }
                     $statement = $pdo->prepare(
-                        'UPDATE feedback SET name = ?, type = ?, summary = ?, channel = ?, created_at = ? WHERE id = ?'
+                        'UPDATE feedback SET name = ?, type = ?, summary = ?, forwarded_to = ?, courtesy_response = ?, channel = ?, created_at = ? WHERE id = ?'
                     );
-                    $statement->execute([$entryName, $type, $summary, $channel, $date . ' 00:00:00', $id]);
+                    $statement->execute([$entryName, $type, $summary, $forwardedTo, $courtesyResponse !== '' ? $courtesyResponse : null, $channel, $date . ' 00:00:00', $id]);
                     $logDatabaseAction('Updated entry', (string)$existing['reference'], 'Feedback entry edited');
                 } else {
                     $prefix = $type === 'Complaint' ? 'C' : 'K';
@@ -150,10 +164,10 @@ try {
                     $sequence = $lastReference !== '' ? (int)substr($lastReference, -4) + 1 : 1;
                     $reference = sprintf('FB-%s-%s%04d', $year, $prefix, $sequence);
                     $statement = $pdo->prepare(
-                        'INSERT INTO feedback (reference, submitted_by, name, type, summary, channel, created_at)
-                         VALUES (?, NULL, ?, ?, ?, ?, ?)'
+                        'INSERT INTO feedback (reference, submitted_by, name, type, summary, forwarded_to, courtesy_response, channel, created_at)
+                         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)'
                     );
-                    $statement->execute([$reference, $entryName, $type, $summary, $channel, $date . ' 00:00:00']);
+                    $statement->execute([$reference, $entryName, $type, $summary, $forwardedTo, $courtesyResponse !== '' ? $courtesyResponse : null, $channel, $date . ' 00:00:00']);
                     $logDatabaseAction('Created entry', $reference, 'Feedback entry created by administrator');
                 }
             } elseif ($action === 'delete_entries') {
@@ -318,6 +332,13 @@ dialog{border:1px solid var(--line);border-radius:14px;background:#fff;color:var
 .statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
 .statbox{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fbfcfe}
 .statbox .l{font-size:11px;color:var(--mu)}.statbox .v{font-size:20px;font-weight:700}
+.ai-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+.ai-card{border:1px solid var(--line);border-radius:12px;padding:15px;background:#fff}
+.ai-card .l{font-size:11px;color:var(--mu)}.ai-card .v{font-size:20px;font-weight:700;margin-top:4px}
+.ai-note{font-size:12px;color:var(--mu);margin:5px 0 0}
+.ai-list{display:grid;gap:10px}
+.ai-item{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe}
+.ai-item b{display:block;font-size:13px;margin-bottom:3px}.ai-item p{margin:0;color:var(--mu);font-size:12px}
 .act{display:flex;gap:6px;flex-wrap:wrap}
 .side-note{margin-top:0;padding:10px;font-size:11px;color:var(--mu);border-top:1px solid var(--line)}
 .admin-profile{margin-top:auto;display:flex;align-items:center;gap:8px;padding:12px 6px;border-top:1px solid var(--line);font-size:12px}
@@ -346,6 +367,19 @@ dialog{border:1px solid var(--line);border-radius:14px;background:#fff;color:var
 <div class="g c2"><div class="card"><h2>Monthly volume</h2><div id="a-m"></div></div><div class="card"><h2>By channel</h2><div id="a-sr"></div></div></div>
 <div class="card"><h2>By quarter</h2><div id="a-q"></div></div>
 <div class="card" style="margin-top:16px"><h2>Recent admin activity</h2><div id="a-recent"></div></div></section>
+
+<section class="v0" id="a-ai">
+<div class="row" style="justify-content:space-between;align-items:center">
+<div><h1 style="margin:0">AI Insights</h1><div class="sub" id="ai-updated" style="margin:0">Analysis of live feedback records.</div></div>
+<button class="btn" id="ai-refresh" type="button">Refresh analysis</button>
+</div>
+<p class="sub">Local, data-backed analysis of feedback categories, priorities, channels and recurring wording. No feedback text is sent to an external AI service.</p>
+<div class="ai-grid" id="ai-summary" aria-live="polite"></div>
+<div class="g c2">
+<div class="card"><h2>Recurring themes</h2><p class="sub">Topics identified from feedback wording.</p><div class="ai-list" id="ai-themes"></div></div>
+<div class="card"><h2>Suggested actions</h2><p class="sub">Practical next steps based on the current register.</p><div class="ai-list" id="ai-actions"></div></div>
+</div>
+</section>
 
 <section class="v0" id="a-reg">
 <div class="row" style="justify-content:space-between;align-items:center">
@@ -421,6 +455,8 @@ dialog{border:1px solid var(--line);border-radius:14px;background:#fff;color:var
 <div><label>Client name</label><input id="ne_name"></div>
 <div><label>Channel</label><select id="ne_src"></select></div>
 <div class="w"><label>Message</label><textarea id="ne_text"></textarea></div>
+<div class="w"><label>Forwarded to</label><input id="ne_forwarded" maxlength="120" placeholder="Officer or department"></div>
+<div class="w"><label>Courtesy response</label><textarea id="ne_courtesy" maxlength="10000" placeholder="Response given to the client, if any"></textarea></div>
 <div class="w act"><button class="btn" id="ne_save">Save</button><button class="btn s" id="ne_cl">Cancel</button></div>
 </div></dialog>
 
@@ -477,7 +513,7 @@ let entries=[],officers=[],settings={},audit=[];
 let regPage=1,regSelected=new Set();
 let editId=null;
 
-const AT=[['a-ov','Overview'],['a-reg','Register'],['a-off','Users'],['a-rep','Reports'],['a-aud','Audit trail'],['a-set','Settings']];
+const AT=[['a-ov','Overview'],['a-ai','AI Insights'],['a-reg','Register'],['a-off','Users'],['a-rep','Reports'],['a-aud','Audit trail'],['a-set','Settings']];
 
 /* ============================================================
    Data loading
@@ -487,8 +523,10 @@ function normalizeEntry(e,i){
   return {
     id:String(e.id||i+1),
     type:e.type||'Complaint',n:+e.id||0,ref:e.reference||'',
+    priority:e.priority||'Medium',
     date,q:qt(date),
     client:e.name||'',text:e.summary||'',src:e.channel||'Website',
+    forwardedTo:e.forwarded_to||'',courtesyResponse:e.courtesy_response||'',
     by:e.submitted_by?'u'+e.submitted_by:'',createdAt:e.created_at||date
   };
 }
@@ -508,7 +546,7 @@ function buildNav(){
 function go(v){
   $$('.v0').forEach(e=>e.classList.toggle('on',e.id===v));
   $$('[data-v]').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
-  const fn={ 'a-ov':ov,'a-reg':reg,'a-off':off,'a-rep':rep,'a-aud':aud,'a-set':set };
+  const fn={ 'a-ov':ov,'a-ai':renderAIInsights,'a-reg':reg,'a-off':off,'a-rep':rep,'a-aud':aud,'a-set':set };
   (fn[v]||(()=>{}))();
   window.scrollTo({top:0,behavior:'smooth'});
 }
@@ -549,6 +587,51 @@ function ov(){
     ||'<div class="em">No admin activity yet.</div>';
 }
 
+function renderAIInsights(){
+  const total=entries.length;
+  const types=cnt(entries,e=>e.type);
+  const channels=cnt(entries,e=>e.src);
+  const topType=types[0];
+  const topChannel=channels[0];
+  const high=entries.filter(e=>e.priority==='High').length;
+  const today=new Date();today.setHours(0,0,0,0);
+  const recentStart=new Date(today);recentStart.setDate(recentStart.getDate()-29);
+  const previousStart=new Date(today);previousStart.setDate(previousStart.getDate()-59);
+  const recent=entries.filter(e=>{const d=new Date(e.date+'T00:00:00');return d>=recentStart&&d<=today}).length;
+  const previous=entries.filter(e=>{const d=new Date(e.date+'T00:00:00');return d>=previousStart&&d<recentStart}).length;
+  const trend=previous===0?(recent?'New activity':'No recent activity'):`${recent>=previous?'+':''}${Math.round((recent-previous)/previous*100)}% vs previous 30 days`;
+  const topics=[
+    ['Response and communication',['response','respond','reply','communication','update','information']],
+    ['Waiting and delays',['wait','waiting','delay','queue','late','slow']],
+    ['Staff and service',['staff','service','attitude','helpful','professional','rude']],
+    ['Digital services',['website','online','portal','system','application','login']],
+    ['Access and facilities',['access','accessible','wheelchair','entrance','facility','building']]
+  ].map(([label,words])=>({
+    label,
+    count:entries.filter(e=>words.some(word=>(e.text||'').toLowerCase().includes(word))).length
+  })).filter(topic=>topic.count>0).sort((a,b)=>b.count-a.count);
+
+  $('#ai-summary').innerHTML=[
+    ['Records analysed',total,'All feedback currently in the register'],
+    ['Leading category',topType?`${topType[0]} · ${topType[1]}`:'No category yet','Most frequently submitted feedback type'],
+    ['High priority',`${high} · ${total?Math.round(high/total*100):0}%`,'Share of all records requiring attention'],
+    ['30-day volume',recent,trend],
+    ['Leading channel',topChannel?`${topChannel[0]} · ${topChannel[1]}`:'No channel yet','Most common submission channel']
+  ].map(([label,value,note])=>`<div class="ai-card"><div class="l">${E(label)}</div><div class="v">${E(value)}</div><p class="ai-note">${E(note)}</p></div>`).join('');
+
+  $('#ai-themes').innerHTML=topics.length
+    ?topics.slice(0,5).map(topic=>`<div class="ai-item"><b>${E(topic.label)}</b><p>Matched in ${topic.count} ${topic.count===1?'record':'records'}.</p></div>`).join('')
+    :'<div class="em">No recurring text themes detected yet. Add feedback summaries to build a useful pattern.</div>';
+  const actions=[];
+  if(high)actions.push([`Review ${high} high-priority ${high===1?'record':'records'}`,'Start with the high-priority items in the feedback register.']);
+  if(topType&&topType[0]==='Complaint'&&topType[1]>0)actions.push(['Investigate complaint drivers',`Complaints lead the register (${topType[1]} records); review these cases for service improvements.`]);
+  if(topics[0])actions.push([`Follow up on ${topics[0].label.toLowerCase()}`,`This theme appears in ${topics[0].count} record${topics[0].count===1?'':'s'}; check whether one operational change could address it.`]);
+  if(topChannel)actions.push([`Monitor the ${topChannel[0]} channel`,`It accounts for ${topChannel[1]} record${topChannel[1]===1?'':'s'}; ensure submissions there are consistently reviewed.`]);
+  if(!total)actions.push(['Start collecting feedback','Insights will appear once feedback records have been submitted.']);
+  $('#ai-actions').innerHTML=actions.map(([title,description])=>`<div class="ai-item"><b>${E(title)}</b><p>${E(description)}</p></div>`).join('');
+  $('#ai-updated').textContent=`Generated ${new Date().toLocaleString()} · ${total} live records analysed`;
+}
+
 /* ============================================================
    Admin — register
    ============================================================ */
@@ -587,17 +670,18 @@ function reg(){
   if(regPage>pages)regPage=pages;
   const start=(regPage-1)*per,pageList=list.slice(start,start+per);
   $('#r-c').textContent=`${list.length} of ${entries.length} entries`;
-  $('#r-tb').innerHTML='<tr><th><input type="checkbox" class="chk" id="r-all" aria-label="Select all on page"></th><th>Ref</th><th>Type</th><th>Date</th><th>Client</th><th>Message</th><th>Channel</th><th></th></tr>'+
+  $('#r-tb').innerHTML='<tr><th><input type="checkbox" class="chk" id="r-all" aria-label="Select all on page"></th><th>Ref</th><th>Type</th><th>Date</th><th>Client</th><th>Message</th><th>Forwarded to</th><th>Courtesy response</th><th>Channel</th><th></th></tr>'+
     (pageList.map(e=>{
       const ck=regSelected.has(e.id)?' checked':'';
       return `<tr>
         <td><input type="checkbox" class="chk r-sel" data-id="${e.id}"${ck}></td>
         <td>${E(e.ref)}</td><td>${E(e.type)}</td><td>${fd(e.date)}</td><td>${E(e.client)}</td>
         <td><div class="tx" title="${E(e.text)}">${E(e.text)}</div></td>
+        <td>${E(e.forwardedTo||'—')}</td><td><div class="tx" title="${E(e.courtesyResponse)}">${E(e.courtesyResponse||'—')}</div></td>
         <td>${E(e.src)}</td>
         <td><div class="act"><button class="btn s" data-edit="${e.id}">Edit</button><button class="btn s" data-del="${e.id}">Del</button></div></td>
       </tr>`;
-    }).join('')||'<tr><td colspan="8" class="em">No matching entries</td></tr>');
+    }).join('')||'<tr><td colspan="10" class="em">No matching entries</td></tr>');
 
   const all=$('#r-all');
   if(all){
@@ -646,14 +730,17 @@ function openNew(id){
   $('#ne_name').value=e?e.client:'';
   $('#ne_src').innerHTML=settings.channels.map(c=>`<option${e&&e.src===c?' selected':''}>${E(c)}</option>`).join('');
   $('#ne_text').value=e?e.text:'';
+  $('#ne_forwarded').value=e?e.forwardedTo:'';
+  $('#ne_courtesy').value=e?e.courtesyResponse:'';
   $('#newDlg').showModal();
 }
 function saveNew(){
   const type=$('#ne_type').value,date=$('#ne_date').value||today();
   const name=$('#ne_name').value.trim(),text=$('#ne_text').value.trim();
+  const forwardedTo=$('#ne_forwarded').value.trim(),courtesyResponse=$('#ne_courtesy').value.trim();
   if(!name||!text){toast('Name and message are required');return}
   saveToDatabase({
-    action:'save_entry',id:editId?Number(editId):0,type,date,name,summary:text,
+    action:'save_entry',id:editId?Number(editId):0,type,date,name,summary:text,forwarded_to:forwardedTo,courtesy_response:courtesyResponse,
     channel:$('#ne_src').value
   });
 }
@@ -736,8 +823,8 @@ function downloadCSV(rows,name){
   setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 function exportEntries(list,name){
-  const rows=[['Reference','Type','Date','Quarter','Client','Message','Channel'],
-    ...list.map(e=>[e.ref,e.type,e.date,e.q,e.client,e.text,e.src])];
+  const rows=[['Reference','Type','Date','Quarter','Client name','Message','Forwarded to','Courtesy response','Channel'],
+    ...list.map(e=>[e.ref,e.type,e.date,e.q,e.client,e.text,e.forwardedTo,e.courtesyResponse,e.src])];
   downloadCSV(rows,name||'feedback-export.csv');
   toast('CSV export downloaded');
 }
@@ -802,6 +889,7 @@ function init(){
   populateFilters();
   bindFilters();
   bindAdmin();
+  $('#ai-refresh').addEventListener('click',renderAIInsights);
   $('#adm').style.display='flex';
   go('a-ov');
 }
