@@ -146,7 +146,7 @@ function get_settings(PDO $pdo): array
 {
     $out = [
         'org'             => 'Public Relations',
-        'channels'        => ['Email','Website','Phone','Walk-in','Social media'],
+        'channels'        => ['Email','Website','Phone','Walk-in','Facebook','X','LinkedIn','Instagram','TikTok'],
         'replyCompliment' => '',
         'replyComplaint'  => '',
     ];
@@ -168,8 +168,13 @@ function get_settings(PDO $pdo): array
         array_map(fn($c) => is_scalar($c) ? trim((string)$c) : '', $list),
         fn($c) => $c !== ''
     ));
+    $out['channels'] = array_values(array_diff($out['channels'], ['Social media']));
+    $out['channels'] = array_values(array_unique(array_merge(
+        $out['channels'],
+        ['Facebook','X','LinkedIn','Instagram','TikTok']
+    )));
     if (!$out['channels']) {
-        $out['channels'] = ['Website'];
+        $out['channels'] = ['Email','Website','Phone','Walk-in','Facebook','X','LinkedIn','Instagram','TikTok'];
     }
 
     return $out;
@@ -183,10 +188,10 @@ function log_action(PDO $pdo, string $actor, string $action, ?string $ref, strin
     $st->execute([':a'=>$actor, ':ac'=>$action, ':r'=>$ref, ':d'=>$profile . ' profile · ' . $details]);
 }
 
-function next_reference(PDO $pdo, string $type): string
+function next_reference(PDO $pdo, string $type, ?string $date = null): string
 {
     $prefix = $type === 'Complaint' ? 'C' : 'K';
-    $year   = date('Y');
+    $year   = $date !== null ? substr($date, 0, 4) : date('Y');
     $st = $pdo->prepare("SELECT reference FROM feedback WHERE reference LIKE :p ORDER BY id DESC LIMIT 1");
     $st->execute([':p' => "FB-$year-$prefix%"]);
     $last = (string)($st->fetchColumn() ?: '');
@@ -217,7 +222,7 @@ if (($_GET['export'] ?? '') === 'csv') {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="feedback-register-' . date('Ymd-His') . '.csv"');
     $out = fopen('php://output', 'w');
-    fputcsv($out, ['Reference','Client name','Type','Priority','Summary','Forwarded to','Courtesy response','Channel','Created']);
+    fputcsv($out, ['Reference','Client name','Type','Priority','Comments','Forwarded to','Courtesy response','Channel','Created']);
     foreach ($rows as $r) {
         fputcsv($out, [
             $r['reference'], $r['name'], $r['type'], $r['priority'],
@@ -254,7 +259,7 @@ if (($_GET['export'] ?? '') === 'report') {
     fputcsv($out, []);
     fputcsv($out, ['Total records', $total]);
     fputcsv($out, []);
-    fputcsv($out, ['Reference','Client name','Type','Priority','Summary','Forwarded to','Courtesy response','Channel','Created']);
+    fputcsv($out, ['Reference','Client name','Type','Priority','Comments','Forwarded to','Courtesy response','Channel','Created']);
     foreach ($rows as $r) {
         fputcsv($out, [
             $r['reference'], $r['name'], $r['type'], $r['priority'],
@@ -280,6 +285,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
         $summary  = trim((string)($_POST['summary'] ?? ''));
         $forwardedTo = trim((string)($_POST['forwarded_to'] ?? ''));
         $courtesyResponse = trim((string)($_POST['courtesy_response'] ?? ''));
+        $feedbackDate = (string)($_POST['feedback_date'] ?? '');
         $channel  = (string)($_POST['channel'] ?? 'Website');
 
         $allowedTypes = ['Complaint','Enquiry','Compliment','Suggestion'];
@@ -288,14 +294,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
         if ($type === 'Complaint' || $type === 'Compliment' || !in_array($priority, $allowedPrio, true)) {
             $priority = 'Medium';
         }
+        $dateIsValid = preg_match('/^\d{4}-\d{2}-\d{2}$/', $feedbackDate)
+            && checkdate((int)substr($feedbackDate, 5, 2), (int)substr($feedbackDate, 8, 2), (int)substr($feedbackDate, 0, 4));
 
-        if ($summary !== '' && mb_strlen($forwardedTo, 'UTF-8') <= 120 && mb_strlen($courtesyResponse, 'UTF-8') <= 10000) {
+        if ($summary !== '' && $dateIsValid && in_array($channel, $settings['channels'], true)
+            && mb_strlen($forwardedTo, 'UTF-8') <= 120 && mb_strlen($courtesyResponse, 'UTF-8') <= 10000) {
             $pdo->beginTransaction();
             try {
-                $ref = next_reference($pdo, $type);
+                $ref = next_reference($pdo, $type, $feedbackDate);
                 $stmt = $pdo->prepare(
-                    'INSERT INTO feedback (reference, submitted_by, name, type, priority, summary, forwarded_to, courtesy_response, channel)
-                     VALUES (:ref, :by, :name, :type, :priority, :summary, :forwarded_to, :courtesy_response, :channel)'
+                    'INSERT INTO feedback (reference, submitted_by, name, type, priority, summary, forwarded_to, courtesy_response, channel, created_at)
+                     VALUES (:ref, :by, :name, :type, :priority, :summary, :forwarded_to, :courtesy_response, :channel, :created_at)'
                 );
                 $stmt->execute([
                     ':ref'      => $ref,
@@ -307,6 +316,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
                     ':forwarded_to' => $forwardedTo,
                     ':courtesy_response' => $courtesyResponse !== '' ? $courtesyResponse : null,
                     ':channel'  => $channel,
+                    ':created_at' => $feedbackDate . ' 00:00:00',
                 ]);
                 log_action($pdo, $name, 'Submitted feedback', $ref, "$type via user portal");
                 $pdo->commit();
@@ -318,7 +328,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
                 flash_set('error', 'Could not save feedback', $ex->getMessage());
             }
         } elseif ($summary === '') {
-            flash_set('error', 'Missing summary', 'Please describe the feedback before submitting.');
+            flash_set('error', 'Missing comments', 'Please add comments describing the feedback before submitting.');
+        } elseif (!$dateIsValid) {
+            flash_set('error', 'Invalid feedback date', 'Enter a valid date for when the compliment or complaint was received.');
+        } elseif (!in_array($channel, $settings['channels'], true)) {
+            flash_set('error', 'Invalid channel', 'Select a valid feedback channel.');
         } else {
             flash_set('error', 'Feedback field too long', 'Forwarded to must be 120 characters or fewer and the courtesy response must be 10,000 characters or fewer.');
         }
@@ -948,15 +962,14 @@ svg{display:block}
             </div>
             <div class="table-scroll">
               <table class="table">
-                <thead><tr><th>Reference / Category</th><th>Submitted by</th><th>Priority</th><th>Received</th></tr></thead>
+                <thead><tr><th>Reference / Category</th><th>Submitted by</th><th>Date of compliment or complaint</th></tr></thead>
                 <tbody>
                 <?php if (!$recent): ?>
-                  <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:28px">No feedback recorded yet.</td></tr>
+                  <tr><td colspan="3" style="text-align:center;color:var(--muted);padding:28px">No feedback recorded yet.</td></tr>
                 <?php else: foreach ($recent as $r): ?>
                   <tr>
                     <td><span class="ref"><?= e($r['reference']) ?></span><div style="font-size:10px;margin-top:3px;color:var(--muted)"><?= e($r['type']) ?></div></td>
                     <td><div class="person"><div class="mini-avatar"><?= e(strtoupper(substr($r['name'],0,1))) ?></div><div><b><?= e($r['name']) ?></b><small><?= e($r['channel']) ?></small></div></div></td>
-                    <td><?= pill_priority($r['priority']) ?></td>
                     <td><?= e(format_date($r['created_at'])) ?></td>
                   </tr>
                 <?php endforeach; endif; ?>
@@ -1014,20 +1027,19 @@ svg{display:block}
           </div>
           <div class="table-scroll">
             <table class="table">
-              <thead><tr><th>Reference</th><th>Client name</th><th>Feedback</th><th>Category</th><th>Priority</th><th>Forwarded to</th><th>Courtesy response</th><th>Received</th></tr></thead>
+              <thead><tr><th>Reference</th><th>Client name</th><th>Comments</th><th>Category</th><th>Date of compliment or complaint</th><th>Forwarded to</th><th>Courtesy response</th></tr></thead>
               <tbody id="caseRows">
               <?php if (!$all): ?>
-              <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:28px">No feedback yet. Click Record feedback to create the first submission.</td></tr>
+              <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:28px">No feedback yet. Click Record feedback to create the first submission.</td></tr>
               <?php else: foreach ($all as $r): ?>
                 <tr data-ref="<?= e($r['reference']) ?>" data-name="<?= e($r['name']) ?>" data-summary="<?= e($r['summary']) ?>" data-forwarded="<?= e($r['forwarded_to']) ?>" data-courtesy="<?= e($r['courtesy_response']) ?>" data-type="<?= e($r['type']) ?>" data-priority="<?= e($r['priority']) ?>">
                   <td><span class="ref"><?= e($r['reference']) ?></span></td>
                   <td><?= e($r['name']) ?></td>
                   <td style="min-width:210px;max-width:280px;white-space:normal"><?= e($r['summary']) ?></td>
                   <td><?= e($r['type']) ?></td>
-                  <td><?= pill_priority($r['priority']) ?></td>
+                  <td><?= e(format_date($r['created_at'])) ?></td>
                   <td><?= e($r['forwarded_to'] ?: '—') ?></td>
                   <td style="min-width:190px;max-width:260px;white-space:normal"><?= e($r['courtesy_response'] ?: '—') ?></td>
-                  <td><?= e(format_date($r['created_at'])) ?></td>
                 </tr>
               <?php endforeach; endif; ?>
               </tbody>
@@ -1164,16 +1176,19 @@ svg{display:block}
           <div class="field"><label for="fType">Category</label><select id="fType" name="type"><option>Complaint</option><option>Enquiry</option><option>Compliment</option><option>Suggestion</option></select></div>
           <div class="field" id="priorityField"><label for="fPriority">Priority</label><select id="fPriority" name="priority"><option>Medium</option><option>High</option><option>Low</option></select></div>
         </div>
-        <div class="field"><label for="fSummary">Feedback summary</label><textarea id="fSummary" name="summary" required placeholder="What was the feedback about?"></textarea></div>
+        <div class="form-grid">
+          <div class="field"><label for="fDate">Date of compliment or complaint</label><input id="fDate" name="feedback_date" type="date" value="<?= e(date('Y-m-d')) ?>" required></div>
+          <div class="field"><label for="fChannel">Channel</label>
+            <select id="fChannel" name="channel">
+              <?php foreach ($settings['channels'] as $c): ?>
+                <option><?= e($c) ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+        </div>
+        <div class="field"><label for="fSummary">Comments</label><textarea id="fSummary" name="summary" required placeholder="Add comments about the compliment or complaint"></textarea></div>
         <div class="field"><label for="fForwarded">Forwarded to</label><input id="fForwarded" name="forwarded_to" maxlength="120" placeholder="Officer or department"></div>
         <div class="field"><label for="fCourtesy">Courtesy response</label><textarea id="fCourtesy" name="courtesy_response" maxlength="10000" placeholder="Response given to the client, if any"></textarea></div>
-        <div class="field"><label for="fChannel">Channel</label>
-          <select id="fChannel" name="channel">
-            <?php foreach ($settings['channels'] as $c): ?>
-              <option><?= e($c) ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
       </div>
       <div class="modal-foot"><button class="btn" type="button" onclick="closeFeedback()">Cancel</button><button class="btn primary" type="submit">Save feedback</button></div>
     </form>
@@ -1188,7 +1203,7 @@ svg{display:block}
       <button class="close-x" type="button" aria-label="Close" onclick="closeHelp()"><span class="icon"><?= $IC['x'] ?></span></button>
     </div>
     <div class="modal-body">
-      <div class="field"><label>Record feedback</label><div style="font-size:12px;color:#334155">Open <strong>Record feedback</strong> from the dashboard or register. Add the client name, category, feedback summary, forwarding destination and any courtesy response. Priority is available for enquiries and suggestions. You'll receive a unique reference (e.g. FB-2026-C0001).</div></div>
+      <div class="field"><label>Record feedback</label><div style="font-size:12px;color:#334155">Open <strong>Record feedback</strong> from the dashboard or register. Add the client name, category, date received, comments, forwarding destination and any courtesy response. Priority is available for enquiries and suggestions. You'll receive a unique reference (e.g. FB-2026-C0001).</div></div>
       <div class="field"><label>Monitor feedback</label><div style="font-size:12px;color:#334155">All submissions appear in the <strong>Feedback register</strong>. Use search and filters to browse records by category and priority.</div></div>
       <div class="field"><label>Export &amp; reports</label><div style="font-size:12px;color:#334155">Use <strong>Export CSV</strong> for the full register, or <strong>Reports centre</strong> for a filtered summary by date range.</div></div>
       <div class="field"><label>Need more help?</label><div style="font-size:12px;color:#334155">Contact your system administrator.</div></div>

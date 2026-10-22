@@ -89,7 +89,7 @@ try {
     $databaseOfficers = $pdo->query('SELECT id, name, email, role FROM users ORDER BY name')->fetchAll();
     $databaseSettings = [
         'org' => 'Public Relations',
-        'channels' => ['Email', 'Website', 'Phone', 'Walk-in', 'Social media'],
+        'channels' => ['Email', 'Website', 'Phone', 'Walk-in', 'Facebook', 'X', 'LinkedIn', 'Instagram', 'TikTok'],
     ];
     foreach ($pdo->query('SELECT k, v FROM settings') as $setting) {
         if (in_array($setting['k'], ['org', 'channels'], true)) {
@@ -102,6 +102,18 @@ try {
         $databaseSettings['channels'] = is_array($decodedChannels)
             ? $decodedChannels
             : array_values(array_filter(array_map('trim', explode(',', $channels))));
+    }
+    $databaseSettings['channels'] = array_values(array_filter(
+        array_map(static fn($channel) => is_scalar($channel) ? trim((string)$channel) : '', (array)$databaseSettings['channels']),
+        static fn(string $channel): bool => $channel !== ''
+    ));
+    $databaseSettings['channels'] = array_values(array_diff($databaseSettings['channels'], ['Social media']));
+    $databaseSettings['channels'] = array_values(array_unique(array_merge(
+        $databaseSettings['channels'],
+        ['Facebook', 'X', 'LinkedIn', 'Instagram', 'TikTok']
+    )));
+    if (!$databaseSettings['channels']) {
+        $databaseSettings['channels'] = ['Email', 'Website', 'Phone', 'Walk-in', 'Facebook', 'X', 'LinkedIn', 'Instagram', 'TikTok'];
     }
     $databaseAudit = $pdo->query('SELECT id, ts, actor, action, ref, details FROM audit_log ORDER BY ts DESC, id DESC LIMIT 1000')->fetchAll();
 
@@ -137,7 +149,9 @@ try {
                 if (!in_array($type, ['Complaint', 'Enquiry', 'Compliment', 'Suggestion'], true)
                     || $entryName === '' || $summary === ''
                     || mb_strlen($forwardedTo, 'UTF-8') > 120 || mb_strlen($courtesyResponse, 'UTF-8') > 10000
-                    || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+                    || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)
+                    || !checkdate((int)substr($date, 5, 2), (int)substr($date, 8, 2), (int)substr($date, 0, 4))
+                    || !in_array($channel, $databaseSettings['channels'], true)) {
                     throw new InvalidArgumentException('Complete all required feedback fields with valid values.');
                 }
 
@@ -180,9 +194,15 @@ try {
                 $statement->execute($ids);
                 $logDatabaseAction('Deleted entries', null, count($ids) . ' feedback record(s) deleted');
             } elseif ($action === 'save_settings') {
+                $channels = array_values(array_filter(array_map('trim', (array)($input['channels'] ?? []))));
+                $channels = array_values(array_diff($channels, ['Social media']));
+                $channels = array_values(array_unique(array_merge(
+                    $channels,
+                    ['Facebook', 'X', 'LinkedIn', 'Instagram', 'TikTok']
+                )));
                 $settingsToSave = [
                     'org' => trim((string)($input['org'] ?? 'Public Relations')) ?: 'Public Relations',
-                    'channels' => json_encode(array_values(array_filter(array_map('trim', (array)($input['channels'] ?? []))))),
+                    'channels' => json_encode($channels),
                 ];
                 $statement = $pdo->prepare('INSERT INTO settings (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)');
                 foreach ($settingsToSave as $key => $value) {
@@ -451,10 +471,10 @@ dialog{border:1px solid var(--line);border-radius:14px;background:#fff;color:var
 
 <dialog id="newDlg"><h2 id="n-h">New feedback entry</h2><div class="f">
 <div><label>Type</label><select id="ne_type"><option>Complaint</option><option>Enquiry</option><option>Compliment</option><option>Suggestion</option></select></div>
-<div><label>Date</label><input type="date" id="ne_date"></div>
+<div><label>Date of compliment or complaint</label><input type="date" id="ne_date" required></div>
 <div><label>Client name</label><input id="ne_name"></div>
 <div><label>Channel</label><select id="ne_src"></select></div>
-<div class="w"><label>Message</label><textarea id="ne_text"></textarea></div>
+<div class="w"><label>Comments</label><textarea id="ne_text" placeholder="Add comments about the compliment or complaint"></textarea></div>
 <div class="w"><label>Forwarded to</label><input id="ne_forwarded" maxlength="120" placeholder="Officer or department"></div>
 <div class="w"><label>Courtesy response</label><textarea id="ne_courtesy" maxlength="10000" placeholder="Response given to the client, if any"></textarea></div>
 <div class="w act"><button class="btn" id="ne_save">Save</button><button class="btn s" id="ne_cl">Cancel</button></div>
@@ -502,7 +522,7 @@ function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('on');
 
 const DEFAULT_SETTINGS={
   org:'Public Relations',
-  channels:['Email','Website','Phone','Walk-in','Social media']
+  channels:['Email','Website','Phone','Walk-in','Facebook','X','LinkedIn','Instagram','TikTok']
 };
 
 
@@ -532,6 +552,9 @@ function normalizeEntry(e,i){
 }
 function loadData(){
   settings=Object.assign({},DEFAULT_SETTINGS,DATABASE_DATA.settings);
+  settings.channels=[...new Set((settings.channels||[]).filter(channel=>channel!=='Social media')
+    .concat(['Facebook','X','LinkedIn','Instagram','TikTok']))];
+  if(!settings.channels.length)settings.channels=DEFAULT_SETTINGS.channels.slice();
   officers=DATABASE_DATA.officers.map(o=>({id:String(o.id),name:o.name,email:o.email,role:o.role==='admin'?'Administrator':'Member',active:true}));
   audit=DATABASE_DATA.audit.map(row=>({id:String(row.id),ts:row.ts,actor:row.actor,action:row.action,ref:row.ref||'',details:row.details||''}));
   entries=DATABASE_DATA.entries.map(normalizeEntry);
@@ -670,7 +693,7 @@ function reg(){
   if(regPage>pages)regPage=pages;
   const start=(regPage-1)*per,pageList=list.slice(start,start+per);
   $('#r-c').textContent=`${list.length} of ${entries.length} entries`;
-  $('#r-tb').innerHTML='<tr><th><input type="checkbox" class="chk" id="r-all" aria-label="Select all on page"></th><th>Ref</th><th>Type</th><th>Date</th><th>Client</th><th>Message</th><th>Forwarded to</th><th>Courtesy response</th><th>Channel</th><th></th></tr>'+
+  $('#r-tb').innerHTML='<tr><th><input type="checkbox" class="chk" id="r-all" aria-label="Select all on page"></th><th>Ref</th><th>Type</th><th>Date</th><th>Client</th><th>Comments</th><th>Forwarded to</th><th>Courtesy response</th><th>Channel</th><th></th></tr>'+
     (pageList.map(e=>{
       const ck=regSelected.has(e.id)?' checked':'';
       return `<tr>
@@ -735,10 +758,10 @@ function openNew(id){
   $('#newDlg').showModal();
 }
 function saveNew(){
-  const type=$('#ne_type').value,date=$('#ne_date').value||today();
+  const type=$('#ne_type').value,date=$('#ne_date').value;
   const name=$('#ne_name').value.trim(),text=$('#ne_text').value.trim();
   const forwardedTo=$('#ne_forwarded').value.trim(),courtesyResponse=$('#ne_courtesy').value.trim();
-  if(!name||!text){toast('Name and message are required');return}
+  if(!date||!name||!text){toast('Date, name and comments are required');return}
   saveToDatabase({
     action:'save_entry',id:editId?Number(editId):0,type,date,name,summary:text,forwarded_to:forwardedTo,courtesy_response:courtesyResponse,
     channel:$('#ne_src').value
@@ -823,7 +846,7 @@ function downloadCSV(rows,name){
   setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 function exportEntries(list,name){
-  const rows=[['Reference','Type','Date','Quarter','Client name','Message','Forwarded to','Courtesy response','Channel'],
+  const rows=[['Reference','Type','Date','Quarter','Client name','Comments','Forwarded to','Courtesy response','Channel'],
     ...list.map(e=>[e.ref,e.type,e.date,e.q,e.client,e.text,e.forwardedTo,e.courtesyResponse,e.src])];
   downloadCSV(rows,name||'feedback-export.csv');
   toast('CSV export downloaded');
